@@ -1,0 +1,90 @@
+# 纯内容站静态版：起 PG → 迁移 → 灌收录数据 → 预渲染静态 HTML → 部署到 GitHub Pages。
+# 仓库：AllenShaoMZ/uuaihub-v2（本目录即仓库根）。Allen 需在 GitHub 点两个开关：
+# Settings → Pages → Build and deployment → Source 选 "GitHub Actions"。
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # 每周日 10:00 CST 重建一次（收录数据有更新就自动上线）
+    - cron: '0 2 * * 0'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aihot
+      SITE_URL: https://allenshaomz.github.io/uuaihub-v2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: 创建数据库
+        run: createdb -h localhost -U postgres aihot || true
+        env:
+          PGPASSWORD: postgres
+
+      - name: 跑迁移
+        run: npm run db:migrate
+
+      - name: 灌收录数据
+        run: node scripts/seed-curation.mjs
+
+      - name: 启动本地服务
+        run: |
+          (npm run dev:api > /tmp/api.log 2>&1 &)
+          (npm run dev:web > /tmp/web.log 2>&1 &)
+          for i in $(seq 1 24); do
+            if curl -sf http://127.0.0.1:3000/ > /dev/null 2>&1; then
+              echo "web ready"
+              break
+            fi
+            sleep 5
+          done
+          curl -sf http://127.0.0.1:3000/ > /dev/null
+
+      - name: 预渲染静态 HTML
+        run: npm run export:static -- --api http://127.0.0.1:3001 --web http://127.0.0.1:3000 --out ./dist-static
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist-static
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
